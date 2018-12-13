@@ -78,6 +78,13 @@ input[type=range]::-moz-range-track {
 			</div>
 		</div>
 	</div>
+	<!-- Auto Dim Settings by Robert Feddeler - https://github.com/RJFeddeler -->
+	<div class="form-group form-inline">
+		<label for="dimrange" class="col-sm-1 col-form-label"><i class="fas fa-moon" aria-hidden title="Auto Dim"></i><span class="sr-only">Auto Dim:</span></label>
+		<div class="col-sm-11">
+			<input type="range" min="0" max="1000" value="500" class="form-control-range" id="dimrange" title="Auto Dim">
+		</div>
+	</div>
 	<div class="form-group form-inline">
 		<label class="col-sm-1 col-form-label"><i class="fas fa-globe-americas" aria-hidden title="Location"></i><span class="sr-only">Location:</span></label>
 		<div class="col-sm-11">
@@ -94,12 +101,39 @@ input[type=range]::-moz-range-track {
 			<div id="map" class="collapse"></div>
 		</div>
 	</div>
+	<!-- Reset WiFi Settings by Robert Feddeler - https://github.com/RJFeddeler -->
+	<div class="form-group form-inline">
+		<div class="col-sm-12">
+			<button type="button" class="btn btn-outline-danger" data-toggle="modal" data-target="#resetWiFiModal" style="float:right;">Reset WiFi Settings</button>
+		</div>
+	</div>
 </form>
 </div>
 <div class="d-none">
 	<div id="card">
 		<div id="controls">
 			<span id="latlng"></span> <button type="button" class="btn btn-success" id="locationButton"><i class="fas fa-check"></i></button>
+		</div>
+	</div>
+</div>
+<!-- Reset WiFi Settings Modal by Robert Feddeler - https://github.com/RJFeddeler -->
+<div class="modal fade" id="resetWiFiModal" tabindex="-1" role="dialog">
+	<div class="modal-dialog" role="document">
+		<div class="modal-content">
+			<div class="modal-header">
+				<h5 class="modal-title">Reset WiFi</h5>
+				<button type="button" class="close" data-dismiss="modal" aria-label="Close">
+					<span aria-hidden="true">&times;</span>
+				</button>
+			</div>
+			<div class="modal-body">
+				<p>Are you sure you want to reset the WiFi settings?</p>
+				<p>You will need to connect to the WiFi network beginning with ESP to choose a new WiFi network.</p>
+			</div>
+			<div class="modal-footer">
+				<button type="button" class="btn btn-secondary" data-dismiss="modal">Cancel</button>
+				<button type="button" id="resetWiFi" class="btn btn-primary" data-dismiss="modal">Reset WiFi</button>
+			</div>
 		</div>
 	</div>
 </div>
@@ -176,12 +210,15 @@ const throttle = (func, limit) => {
 var huerange = document.getElementById("huerange");
 var satrange = document.getElementById("satrange");
 var valrange = document.getElementById("valrange");
+var dimrange = document.getElementById("dimrange");
 
 function updateBackground() {
 	var hue = huerange.value;
 	satrange.style.background = "linear-gradient(to right,#FFF,hsl(" + hue + ",100%,50%))";
 	var sat = satrange.value;
 	valrange.style.background = "linear-gradient(to right,#000,hsl(" + hue + ",100%," + (100 - sat/2) + "%))";
+	var dim = dimrange.value;
+	dimrange.style.background = "linear-gradient(to right,#000," + (dim > 0 ? "#FFF" : "#000") + ")";
 }
 
 function changeColor() {
@@ -191,12 +228,32 @@ function changeColor() {
 	xmlHttp.send();
 }
 
+// Auto Dim by Robert Feddeler - https://github.com/RJFeddeler
+function changeAutoDim() {
+	var xmlHttp = new XMLHttpRequest();
+	xmlHttp.open("PUT", "dim");
+	xmlHttp.setRequestHeader('Content-Type', 'application/json');
+	xmlHttp.send(this.value);
+}
+
+// Reset WiFi Settings by Robert Feddeler - https://github.com/RJFeddeler
+function resetWiFiSettings() {
+	var xmlHttp = new XMLHttpRequest();
+	xmlHttp.open("PUT", "resetWiFi");
+	xmlHttp.setRequestHeader('Content-Type', 'application/json');
+	xmlHttp.send();
+}
+
 huerange.addEventListener("input", updateBackground);
 satrange.addEventListener("input", updateBackground);
+dimrange.addEventListener("input", updateBackground);
+
 var throttledChangeColor = throttle(changeColor, 500);
 huerange.addEventListener("input", throttledChangeColor);
 satrange.addEventListener("input", throttledChangeColor);
 valrange.addEventListener("input", throttledChangeColor);
+
+dimrange.addEventListener("input", changeAutoDim);
 
 var huerangeBackground = "linear-gradient(to right";
 for (var i =0; i <= 360; i++) {
@@ -214,6 +271,9 @@ $('input[type=radio][name=clock]').change(function() {
 	xmlHttp.setRequestHeader('Content-Type', 'application/json');
 	xmlHttp.send(this.value);
 });
+
+// Reset WiFi Settings by Robert Feddeler - https://github.com/RJFeddeler
+$( "#resetWiFi" ).click(resetWiFiSettings);
 
 (function loadConfig() {
 	var xmlHttp = new XMLHttpRequest();
@@ -237,6 +297,7 @@ $('input[type=radio][name=clock]').change(function() {
 			huerange.value = color.h;
 			satrange.value = color.s;
 			valrange.value = color.v;
+			dimrange.value = json.dim;
 			updateBackground();
 
 			// location
@@ -253,7 +314,7 @@ $('input[type=radio][name=clock]').change(function() {
 				initialLat = parseFloat(json.location.ipLatitude);
 				initialLng = parseFloat(json.location.ipLongitude);
 			}
-			if (isNaN(initialLat) && isNan(initialLng)) {
+			if (isNaN(initialLat) && isNaN(initialLng)) {
 				// 	Reykjavik, because always UTC
 				initialLat = 64.1265;
 				initialLng = -21.8174;

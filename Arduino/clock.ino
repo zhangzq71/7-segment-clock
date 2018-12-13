@@ -1,3 +1,6 @@
+// Original Code by leonardlee - https://github.com/leoclee
+// Modified by Robert Feddeler - https://github.com/RJFeddeler
+
 #include <FS.h>                         // this needs to be first, or it all crashes and burns...
 #include <ESP8266WiFi.h>
 #include <DNSServer.h>                  // Local DNS Server used for redirecting all requests to the configuration portal
@@ -10,44 +13,55 @@
 #include <TimeLib.h>                    // https://github.com/PaulStoffregen/Time
 #include <ArduinoJson.h>                // https://github.com/bblanchon/ArduinoJson/
 #include <ESP8266SSDP.h>
-#define FASTLED_INTERRUPT_RETRY_COUNT 0 // https://github.com/FastLED/FastLED/issues/367 decided against disabling FASTLED_ALLOW_INTERRUPTS due to WDT resets
-#include <FastLED.h>
+#include <NeoPixelBus.h>
 
-#define NUM_LEDS_HOUR 15
-#define NUM_LEDS_MINUTE 31
-#define DATA_PIN_HOUR D2
-#define DATA_PIN_MINUTE D6
+#define DIGIT_HOUR          1
+#define DIGIT_MINUTE        2
 
-// LED
-CRGB ledsHour[NUM_LEDS_HOUR];
-CRGB ledsMinute[NUM_LEDS_MINUTE];
-CHSV fromColor;
-CHSV toColor = CHSV(128, 255, 128);
-CHSV currentColor = CHSV(0, 0, 0);
-CHSV savedColor;
+#define LED_COLON1          0
+#define LED_COLON2         15
+#define LED_HOUR1           7
+#define LED_HOUR2           0
+#define LED_MINUTE1        15
+#define LED_MINUTE2        22
+
+#define PHOTORESISTOR_PIN  A0
+#define colorSaturation    128
+
+WiFiManager wifiManager;
+
+NeoGamma<NeoGammaTableMethod> colorGamma;
+NeoPixelBus<NeoGrbFeature, Neo800KbpsMethod> strip(30);
+
+RgbColor black(0);
+
+HslColor fromColor(black);
+HslColor toColor(RgbColor(255, 0, 0));
+HslColor currentColor(fromColor);
+HslColor savedColor(toColor);
+
 unsigned long lastColorChangeTime = 0;
-unsigned long colorSaveInterval = 15000; // number of milliseconds to wait for a color change to trigger a save
+unsigned long colorSaveInterval = 15000;
 
-uint8_t lerp = 0;
 bool fading = false;
+uint16_t lerp = 0;
 
-int tzOffset = 0;
+int autoDimValue = 500;
+const float dimmedValueMax = 0.24f;
 
 ESP8266WebServer server(80);
 
-// openssl s_client -connect maps.googleapis.com:443 | openssl x509 -fingerprint -noout
-//const char* gMapsCrt = "92:AC:F0:5A:A8:20:A2:0D:D2:4F:20:28:2D:98:00:1F:E1:4B:99:5E";
 char googleApiKey[40] = "";
 char ipstackApiKey[33] = "";
+
+int tzOffset = 0;
+bool isTwelveHour = true;
 
 String ipLatitude = "";
 String ipLongitude = "";
 String overrideLatitude = "";
 String overrideLongitude = "";
 
-bool isTwelveHour = false;
-
-// TODO is this better than https://github.com/zenmanenergy/ESP8266-Arduino-Examples/blob/master/helloWorld_urlencoded/urlencode.ino ?
 String UrlEncode(const String url) {
   String e;
   for (int i = 0; i < url.length(); i++) {
@@ -66,6 +80,7 @@ String UrlEncode(const String url) {
 }
 
 void getIPlocation() { // Using ipstack.com to map public IP's location
+  
   HTTPClient http;
   String URL = "http://api.ipstack.com/check?fields=latitude,longitude&access_key=" + String(ipstackApiKey); // no host or IP specified returns client's public IP info
   String payload;
@@ -184,10 +199,8 @@ time_t getNtpTime () {
   return time(nullptr) + tzOffset;
 }
 
-//flag for saving data
-bool shouldSaveConfig = false;
-
 //callback notifying us of the need to save config
+bool shouldSaveConfig = false;
 void saveConfigCallback () {
   Serial.println("Should save config");
   shouldSaveConfig = true;
@@ -197,15 +210,14 @@ void setup() {
   Serial.begin(115200);
   Serial.println();
 
-  // initialize and reset LEDs
-  delay(1); // leds sometimes not all resetting properly without this for some reason
-  FastLED.addLeds<NEOPIXEL, DATA_PIN_HOUR>(ledsHour, NUM_LEDS_HOUR);
-  FastLED.addLeds<NEOPIXEL, DATA_PIN_MINUTE>(ledsMinute, NUM_LEDS_MINUTE);
-  fill_solid(ledsHour, NUM_LEDS_HOUR, CRGB::Black);
-  fill_solid(ledsMinute, NUM_LEDS_MINUTE, CRGB::Black);
-  FastLED.show();
+  pinMode(PHOTORESISTOR_PIN, INPUT);
 
-  //read configuration from FS json
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+
+  strip.Begin();
+  strip.ClearTo(black);
+  strip.Show();
+    
   Serial.println("mounting FS...");
 
   if (SPIFFS.begin()) {
@@ -246,7 +258,7 @@ void setup() {
           JsonVariant val = json["color"]["v"];
           if (hue.success() && sat.success() && val.success()) {
             // store initial color in toColor... hopefully this is OK
-            toColor = CHSV((hue.as<int>() % 360) * 255 / 360, constrain(sat.as<int>(), 0, 100) * 255 / 100, constrain(val.as<int>(), 0, 100) * 255 / 100);
+            toColor = HslColor((hue.as<int>() % 360) / 360.0f, constrain(sat.as<int>(), 0, 100) / 100.0f, constrain(val.as<int>(), 0, 100) / 100.0f);
           }
           savedColor = toColor;
 
@@ -254,6 +266,11 @@ void setup() {
           JsonVariant clk = json["clock"];
           if (clk.success() && clk.is<int>()) {
             isTwelveHour = clk.as<int>() == 12;
+          }
+
+          JsonVariant dim = json["dim"];
+          if (dim.success() && dim.is<int>()) {
+            autoDimValue = dim.as<int>();
           }
         } else {
           Serial.println("failed to load json config");
@@ -274,8 +291,6 @@ void setup() {
   WiFiManagerParameter customIpstackApiKey("ipstackApiKey", "ipstack API Key", ipstackApiKey, 33);
 
   //WiFiManager
-  //Local intialization. Once its business is done, there is no need to keep it around
-  WiFiManager wifiManager;
   wifiManager.setSaveConfigCallback(saveConfigCallback);
   wifiManager.addParameter(&customGoogleApiKey);
   wifiManager.addParameter(&customIpstackApiKey);
@@ -292,10 +307,9 @@ void setup() {
   }
 
   // match the fade in color's hue and saturation
-  currentColor = CHSV(toColor.h, toColor.s, 0);
+  currentColor = HslColor(toColor.H, toColor.S, 0.0f);
 
   if (overrideLatitude == "" || overrideLongitude == "") {
-    // if no override location specified, attempt to look up using IP based geolocation
     getIPlocation();
   }
   time_t nowUtc = getNtpTime();
@@ -310,7 +324,13 @@ void setup() {
     String s = server.arg("s");
     String v = server.arg("v");
     if (h != "" && s != "" && v != "") {
-      setColor(h.toInt(), s.toInt(), v.toInt());
+      Serial.print("SERVER.ON('/color'): H=");
+      Serial.print(h.toInt());
+      Serial.print(", S=");
+      Serial.print(s.toInt());
+      Serial.print(", V=");
+      Serial.println(v.toInt());
+      setColor((h.toInt() % 360) / 360.0f, constrain(s.toInt(), 0, 100) / 100.0f, constrain(v.toInt(), 0, 100) / 200.0f);
       server.send(204);
     }
   });
@@ -320,9 +340,10 @@ void setup() {
     DynamicJsonBuffer jsonBuffer(bufferSize);
 
     JsonObject& root = jsonBuffer.createObject();
-    root["h"] = toColor.hue * 360 / 255;
-    root["s"] = toColor.saturation * 100 / 255;
-    root["v"] = toColor.value * 100 / 255;
+    
+    root["h"] = (int)(toColor.H * 360.0f);
+    root["s"] = (int)(toColor.S * 100.0f);
+    root["v"] = (int)(toColor.L * 200.0f);
 
     String jsonString;
     root.printTo(jsonString);
@@ -355,6 +376,23 @@ void setup() {
     }
   });
 
+  server.on("/resetWiFi", HTTP_PUT, []() {
+    server.send(204);
+    wifiManager.resetSettings();
+  });
+
+  server.on("/dim", HTTP_PUT, []() {
+    String body = server.arg("plain");
+    if (body != "") {
+      autoDimValue = constrain(body.toInt(), 0, 1000);
+      server.send(204);
+    }
+  });
+
+  server.on("/dim", HTTP_GET, []() {
+    server.send(200, "text/plain", String(autoDimValue));
+  });
+  
   server.on("/location", HTTP_GET, []() {
     const size_t bufferSize = JSON_OBJECT_SIZE(4); // https://arduinojson.org/v5/assistant/
     DynamicJsonBuffer jsonBuffer(bufferSize);
@@ -383,7 +421,7 @@ void setup() {
       saveConfig();
     }
   });
-
+  
   server.on("/config", HTTP_GET, []() {
     const size_t bufferSize = JSON_OBJECT_SIZE(3) + 2*JSON_OBJECT_SIZE(4); // https://arduinojson.org/v5/assistant/
     DynamicJsonBuffer jsonBuffer(bufferSize);
@@ -391,10 +429,12 @@ void setup() {
     JsonObject& root = jsonBuffer.createObject();
 
     JsonObject& color = root.createNestedObject("color");
-    color["h"] = toColor.hue * 360 / 255;
-    color["s"] = toColor.saturation * 100 / 255;
-    color["v"] = toColor.value * 100 / 255;
+    color["h"] = (int)(toColor.H * 360.0f);
+    color["s"] = (int)(toColor.S * 100.0f);
+    color["v"] = (int)(toColor.L * 200.0f);
+    
     root["clock"] = isTwelveHour ? 12 : 24;
+    root["dim"] = autoDimValue;
     JsonObject& location = root.createNestedObject("location");
     location["ipLatitude"] = ipLatitude;
     location["ipLongitude"] = ipLongitude;
@@ -471,32 +511,39 @@ void setup() {
   });
   ArduinoOTA.begin();
 
-  //pinMode(LED_BUILTIN, OUTPUT);
-  //digitalWrite(LED_BUILTIN, HIGH);
-
+  /*
   Serial.println();
   Serial.print(F("Last reset reason: "));
   Serial.println(ESP.getResetReason());
   Serial.print(F("WiFi Hostname: "));
   Serial.println(WiFi.hostname());
+  */
   Serial.print(F("WiFi IP addr: "));
   Serial.println(WiFi.localIP());
   Serial.print(F("WiFi MAC addr: "));
   Serial.println(WiFi.macAddress());
   Serial.print(F("WiFi SSID: "));
   Serial.println(WiFi.SSID());
+  /*
   Serial.print(F("ESP Sketch size: "));
   Serial.println(ESP.getSketchSize());
   Serial.print(F("ESP Flash free: "));
   Serial.println(ESP.getFreeSketchSpace());
   Serial.print(F("ESP Flash Size: "));
   Serial.println(ESP.getFlashChipRealSize());
-
-  // TODO access point name
+  */
 }
 
 int currentMinute = 0;
+uint32_t lastLightRead = 0;
 boolean first = true;
+int ambientLight;
+
+const int8_t dimCounterMax = 4;
+int8_t dimCounter = 0;
+bool dimmed = false;
+float dimmedValue = 0.0f;
+int dimProgress = 0;
 
 void loop() {
   server.handleClient();
@@ -506,6 +553,7 @@ void loop() {
       setColor(toColor);
       first = false;
     }
+    
     if (minute() != currentMinute) {
       // check for new offset every hour between midnight and 4AM for DST change
       // see: https://www.timeanddate.com/time/dst/statistics.html#dstuse
@@ -515,17 +563,54 @@ void loop() {
       }
       printTime();
     }
+    
     currentMinute = minute();
-
     updateLeds();
   }
+  
   fadeToColor();
   saveColorChange();
+
+  if (dimmed && dimmedValue > dimmedValueMax) {
+    if (dimProgress < 512)
+      dimmedValue = HslColor::LinearBlend<NeoHueBlendShortestDistance>(currentColor, HslColor(currentColor.H, currentColor.S, dimmedValueMax), ++dimProgress / 512.0f).L;
+    else
+      dimmedValue = dimmedValueMax;
+  }
+
+  if (dimmedValueMax < toColor.L && millis() - lastLightRead >= 100) {
+    ambientLight = analogRead(PHOTORESISTOR_PIN);
+    lastLightRead = millis();
+  
+    if (!dimmed && ambientLight < autoDimValue) {
+      if (++dimCounter > dimCounterMax) {
+        dimCounter = 0;
+        dimmed = true;
+        dimmedValue = currentColor.L;
+        dimProgress = 0;
+        Serial.println("Dim: ON");
+      }
+    }
+    else if (dimmed && ambientLight > autoDimValue) {
+      if (++dimCounter > dimCounterMax) {
+        dimCounter = 0;
+        dimmed = false;
+        float origValue = currentColor.L;
+        currentColor = HslColor(currentColor.H, currentColor.S, dimmedValue);
+        setColor(currentColor.H, currentColor.S, origValue);
+        Serial.println("Dim: OFF");
+      }
+    }
+    else {
+      if (dimCounter > 0)
+        dimCounter = 0;
+    }
+  }
 }
 
 // throttle color change induced saving to avoid unnecessary write/erase cycles
 void saveColorChange() {
-  if (toColor != savedColor && ((millis() - lastColorChangeTime) > colorSaveInterval)) {
+  if (!hslEqual(toColor, savedColor) && ((millis() - lastColorChangeTime) > colorSaveInterval)) {
     Serial.println("config save triggered by color change");
     saveConfig();
   }
@@ -554,10 +639,13 @@ void saveConfig() {
   location["overrideLatitude"] = overrideLatitude;
   location["overrideLongitude"] = overrideLongitude;
   JsonObject& color = json.createNestedObject("color");
-  color["h"] = toColor.hue * 360 / 255;
-  color["s"] = toColor.saturation * 100 / 255;
-  color["v"] = toColor.value * 100 / 255;
+  
+  color["h"] = (int)(toColor.H * 360.0f);
+  color["s"] = (int)(toColor.S * 100.0f);
+  color["v"] = (int)(toColor.L * 100.0f);
+  
   json["clock"] = isTwelveHour ? 12 : 24;
+  json["dim"] = autoDimValue;
 
   File configFile = SPIFFS.open("/config.json", "w");
   if (!configFile) {
@@ -568,182 +656,156 @@ void saveConfig() {
   json.printTo(configFile);
   configFile.close();
 
-  savedColor = toColor;
+  savedColor = HslColor(toColor);
 }
 
 void updateLeds() {
-  fill_solid(ledsHour, NUM_LEDS_HOUR, CRGB::Black);
-  ledsHour[0] = currentColor; // colon
+  strip.ClearTo(black);
+
+  // Colon
+
+  strip.SetPixelColor(LED_COLON1, (dimmed && currentColor.L > dimmedValue) ? colorGamma.Correct(RgbColor(HslColor(currentColor.H, currentColor.S, dimmedValue))) : colorGamma.Correct(RgbColor(currentColor)));
+  strip.SetPixelColor(LED_COLON2, (dimmed && currentColor.L > dimmedValue) ? colorGamma.Correct(RgbColor(HslColor(currentColor.H, currentColor.S, dimmedValue))) : colorGamma.Correct(RgbColor(currentColor)));
+
   int displayHour = isTwelveHour ? hourFormat12() : hour();
   if (displayHour >= 10 || !isTwelveHour) {
-    displayHourDigit(7, displayHour / 10);
+    displayDigit(LED_HOUR1, DIGIT_HOUR, displayHour / 10);
   }
-  displayHourDigit(0, displayHour % 10);
+  displayDigit(LED_HOUR2, DIGIT_HOUR, displayHour % 10);
 
-  fill_solid (ledsMinute, NUM_LEDS_MINUTE, CRGB::Black);
-  ledsMinute[0] = currentColor; // colon
   int displayMinute = minute();
-  displayMinuteDigit(0, (displayMinute < 10) ? 0 : displayMinute / 10);
-  displayMinuteDigit(7, displayMinute % 10);
-  ledsMinute[15] = currentColor; // colon
-  ledsMinute[16] = currentColor; // colon
-  int displaySecond = second();
-  displayMinuteDigit(16, (displaySecond < 10) ? 0 : displaySecond / 10);
-  displayMinuteDigit(23, displaySecond % 10);
+  displayDigit(LED_MINUTE1, DIGIT_MINUTE, (displayMinute < 10) ? 0 : displayMinute / 10);
+  displayDigit(LED_MINUTE2, DIGIT_MINUTE, displayMinute % 10);
 
-  FastLED.show();
+  strip.Show();
 }
 
-/**
-   sets the proper LEDs to the current color to display a digit on the hour (left) side of the controller, assuming that all LEDs for the digit are already set to black
-*/
-void displayHourDigit(int offset, int digit) {
-  switch (digit) {
-    case 0:
-      ledsHour[offset + 1] = currentColor;
-      ledsHour[offset + 2] = currentColor;
-      ledsHour[offset + 3] = currentColor;
-      ledsHour[offset + 5] = currentColor;
-      ledsHour[offset + 6] = currentColor;
-      ledsHour[offset + 7] = currentColor;
-      break;
-    case 1:
-      ledsHour[offset + 1] = currentColor;
-      ledsHour[offset + 5] = currentColor;
-      break;
-    case 2:
-      ledsHour[offset + 1] = currentColor;
-      ledsHour[offset + 2] = currentColor;
-      ledsHour[offset + 4] = currentColor;
-      ledsHour[offset + 6] = currentColor;
-      ledsHour[offset + 7] = currentColor;
-      break;
-    case 3:
-      ledsHour[offset + 1] = currentColor;
-      ledsHour[offset + 2] = currentColor;
-      ledsHour[offset + 4] = currentColor;
-      ledsHour[offset + 5] = currentColor;
-      ledsHour[offset + 6] = currentColor;
-      break;
-    case 4:
-      ledsHour[offset + 1] = currentColor;
-      ledsHour[offset + 3] = currentColor;
-      ledsHour[offset + 4] = currentColor;
-      ledsHour[offset + 5] = currentColor;
-      break;
-    case 5:
-      ledsHour[offset + 2] = currentColor;
-      ledsHour[offset + 3] = currentColor;
-      ledsHour[offset + 4] = currentColor;
-      ledsHour[offset + 5] = currentColor;
-      ledsHour[offset + 6] = currentColor;
-      break;
-    case 6:
-      ledsHour[offset + 2] = currentColor;
-      ledsHour[offset + 3] = currentColor;
-      ledsHour[offset + 4] = currentColor;
-      ledsHour[offset + 5] = currentColor;
-      ledsHour[offset + 6] = currentColor;
-      ledsHour[offset + 7] = currentColor;
-      break;
-    case 7:
-      ledsHour[offset + 1] = currentColor;
-      ledsHour[offset + 2] = currentColor;
-      ledsHour[offset + 5] = currentColor;
-      break;
-    case 8:
-      ledsHour[offset + 1] = currentColor;
-      ledsHour[offset + 2] = currentColor;
-      ledsHour[offset + 3] = currentColor;
-      ledsHour[offset + 4] = currentColor;
-      ledsHour[offset + 5] = currentColor;
-      ledsHour[offset + 6] = currentColor;
-      ledsHour[offset + 7] = currentColor;
-      break;
-    case 9:
-      ledsHour[offset + 1] = currentColor;
-      ledsHour[offset + 2] = currentColor;
-      ledsHour[offset + 3] = currentColor;
-      ledsHour[offset + 4] = currentColor;
-      ledsHour[offset + 5] = currentColor;
-      ledsHour[offset + 6] = currentColor;
-      break;
-  }
-}
+void displayDigit(int offset, int digitUnit, int value) {
+  HslColor c(currentColor);
+  if (dimmed && c.L > dimmedValue)
+    c.L = dimmedValue;
 
-/**
-   sets the proper LEDs to the current color to display a digit on the minute (right) side of the controller, assuming that all LEDs for the digit are already set to black
-*/
-void displayMinuteDigit(int offset, int digit) {
-  switch (digit) {
+  c = colorGamma.Correct(RgbColor(c));
+    
+  switch (value) {
     case 0:
-      ledsMinute[offset + 1] = currentColor;
-      ledsMinute[offset + 2] = currentColor;
-      ledsMinute[offset + 3] = currentColor;
-      ledsMinute[offset + 5] = currentColor;
-      ledsMinute[offset + 6] = currentColor;
-      ledsMinute[offset + 7] = currentColor;
+      strip.SetPixelColor(offset + 1, c);
+      strip.SetPixelColor(offset + 2, c);
+      strip.SetPixelColor(offset + 3, c);
+      strip.SetPixelColor(offset + 5, c);
+      strip.SetPixelColor(offset + 6, c);
+      strip.SetPixelColor(offset + 7, c);
       break;
     case 1:
-      ledsMinute[offset + 3] = currentColor;
-      ledsMinute[offset + 7] = currentColor;
+      if (digitUnit == DIGIT_HOUR) {
+        strip.SetPixelColor(offset + 1, c);
+        strip.SetPixelColor(offset + 5, c);
+      }
+      else {
+        strip.SetPixelColor(offset + 3, c);
+        strip.SetPixelColor(offset + 7, c);
+      }
       break;
     case 2:
-      ledsMinute[offset + 1] = currentColor;
-      ledsMinute[offset + 2] = currentColor;
-      ledsMinute[offset + 4] = currentColor;
-      ledsMinute[offset + 6] = currentColor;
-      ledsMinute[offset + 7] = currentColor;
+      strip.SetPixelColor(offset + 1, c);
+      strip.SetPixelColor(offset + 2, c);
+      strip.SetPixelColor(offset + 4, c);
+      strip.SetPixelColor(offset + 6, c);
+      strip.SetPixelColor(offset + 7, c);
       break;
     case 3:
-      ledsMinute[offset + 2] = currentColor;
-      ledsMinute[offset + 3] = currentColor;
-      ledsMinute[offset + 4] = currentColor;
-      ledsMinute[offset + 6] = currentColor;
-      ledsMinute[offset + 7] = currentColor;
+      if (digitUnit == DIGIT_HOUR) {
+        strip.SetPixelColor(offset + 1, c);
+        strip.SetPixelColor(offset + 2, c);
+        strip.SetPixelColor(offset + 4, c);
+        strip.SetPixelColor(offset + 5, c);
+        strip.SetPixelColor(offset + 6, c);
+      }
+      else {
+        strip.SetPixelColor(offset + 2, c);
+        strip.SetPixelColor(offset + 3, c);
+        strip.SetPixelColor(offset + 4, c);
+        strip.SetPixelColor(offset + 6, c);
+        strip.SetPixelColor(offset + 7, c);
+      }
       break;
     case 4:
-      ledsMinute[offset + 3] = currentColor;
-      ledsMinute[offset + 4] = currentColor;
-      ledsMinute[offset + 5] = currentColor;
-      ledsMinute[offset + 7] = currentColor;
+      if (digitUnit == DIGIT_HOUR) {
+        strip.SetPixelColor(offset + 1, c);
+        strip.SetPixelColor(offset + 3, c);
+        strip.SetPixelColor(offset + 4, c);
+        strip.SetPixelColor(offset + 5, c);
+      }
+      else {
+        strip.SetPixelColor(offset + 3, c);
+        strip.SetPixelColor(offset + 4, c);
+        strip.SetPixelColor(offset + 5, c);
+        strip.SetPixelColor(offset + 7, c);
+      }
       break;
     case 5:
-      ledsMinute[offset + 2] = currentColor;
-      ledsMinute[offset + 3] = currentColor;
-      ledsMinute[offset + 4] = currentColor;
-      ledsMinute[offset + 5] = currentColor;
-      ledsMinute[offset + 6] = currentColor;
+      strip.SetPixelColor(offset + 2, c);
+      strip.SetPixelColor(offset + 3, c);
+      strip.SetPixelColor(offset + 4, c);
+      strip.SetPixelColor(offset + 5, c);
+      strip.SetPixelColor(offset + 6, c);
       break;
     case 6:
-      ledsMinute[offset + 1] = currentColor;
-      ledsMinute[offset + 2] = currentColor;
-      ledsMinute[offset + 3] = currentColor;
-      ledsMinute[offset + 4] = currentColor;
-      ledsMinute[offset + 5] = currentColor;
-      ledsMinute[offset + 6] = currentColor;
+      if (digitUnit == DIGIT_HOUR) {
+        strip.SetPixelColor(offset + 2, c);
+        strip.SetPixelColor(offset + 3, c);
+        strip.SetPixelColor(offset + 4, c);
+        strip.SetPixelColor(offset + 5, c);
+        strip.SetPixelColor(offset + 6, c);
+        strip.SetPixelColor(offset + 7, c);
+      }
+      else {
+        strip.SetPixelColor(offset + 1, c);
+        strip.SetPixelColor(offset + 2, c);
+        strip.SetPixelColor(offset + 3, c);
+        strip.SetPixelColor(offset + 4, c);
+        strip.SetPixelColor(offset + 5, c);
+        strip.SetPixelColor(offset + 6, c);
+      }
       break;
     case 7:
-      ledsMinute[offset + 3] = currentColor;
-      ledsMinute[offset + 6] = currentColor;
-      ledsMinute[offset + 7] = currentColor;
+      if (digitUnit == DIGIT_HOUR) {
+        strip.SetPixelColor(offset + 1, c);
+        strip.SetPixelColor(offset + 2, c);
+        strip.SetPixelColor(offset + 5, c);
+      }
+      else {
+        strip.SetPixelColor(offset + 3, c);
+        strip.SetPixelColor(offset + 6, c);
+        strip.SetPixelColor(offset + 7, c);
+      }
       break;
     case 8:
-      ledsMinute[offset + 1] = currentColor;
-      ledsMinute[offset + 2] = currentColor;
-      ledsMinute[offset + 3] = currentColor;
-      ledsMinute[offset + 4] = currentColor;
-      ledsMinute[offset + 5] = currentColor;
-      ledsMinute[offset + 6] = currentColor;
-      ledsMinute[offset + 7] = currentColor;
+      strip.SetPixelColor(offset + 1, c);
+      strip.SetPixelColor(offset + 2, c);
+      strip.SetPixelColor(offset + 3, c);
+      strip.SetPixelColor(offset + 4, c);
+      strip.SetPixelColor(offset + 5, c);
+      strip.SetPixelColor(offset + 6, c);
+      strip.SetPixelColor(offset + 7, c);
       break;
     case 9:
-      ledsMinute[offset + 2] = currentColor;
-      ledsMinute[offset + 3] = currentColor;
-      ledsMinute[offset + 4] = currentColor;
-      ledsMinute[offset + 5] = currentColor;
-      ledsMinute[offset + 6] = currentColor;
-      ledsMinute[offset + 7] = currentColor;
+      if (digitUnit == DIGIT_HOUR) {
+        strip.SetPixelColor(offset + 1, c);
+        strip.SetPixelColor(offset + 2, c);
+        strip.SetPixelColor(offset + 3, c);
+        strip.SetPixelColor(offset + 4, c);
+        strip.SetPixelColor(offset + 5, c);
+        strip.SetPixelColor(offset + 6, c);
+      }
+      else {
+        strip.SetPixelColor(offset + 2, c);
+        strip.SetPixelColor(offset + 3, c);
+        strip.SetPixelColor(offset + 4, c);
+        strip.SetPixelColor(offset + 5, c);
+        strip.SetPixelColor(offset + 6, c);
+        strip.SetPixelColor(offset + 7, c);
+      }
       break;
   }
 }
@@ -773,35 +835,42 @@ void printDigits(int digits)
   Serial.print(digits);
 }
 
-void setColor(int h, int s, int v) {
-  int hue = (h % 360) * 255 / 360;
-  int sat = constrain(s, 0, 100) * 255 / 100;
-  int val = constrain(v, 0, 100) * 255 / 100;
-
-  setColor(CHSV(hue, sat, val));
+void setColor(float h, float s, float l) {
+  setColor(HslColor(h, s, l));
 }
 
-void setColor(CHSV chsv) {
+void setColor(HslColor hsl) {
   lastColorChangeTime = millis();
+
   Serial.print("setting color to CHSV(");
-  Serial.print(chsv.h);
+  Serial.print(hsl.H);
   Serial.print(", ");
-  Serial.print(chsv.s);
+  Serial.print(hsl.S);
   Serial.print(", ");
-  Serial.print(chsv.v);
+  Serial.print(hsl.L);
   Serial.println(")");
-  fromColor = currentColor;
-  toColor = chsv;
+  
+  fromColor = HslColor(currentColor);
+  toColor = HslColor(hsl);
+  
   lerp = 0;
   fading = true;
 }
 
+bool hslEqual(HslColor color1, HslColor color2) {
+  if (color1.H == color2.H && color1.S == color2.S && color1.L == color2.L)
+    return true;
+  else
+    return false;
+}
+
 void fadeToColor() {
   if (fading) {
-    if (lerp < 255) {
-      currentColor = blend(fromColor, toColor, ++lerp);
+    if (lerp < 512) {
+      currentColor = HslColor::LinearBlend<NeoHueBlendShortestDistance>(fromColor, toColor, ++lerp / 512.0f);
     } else {
       fading = false;
+      currentColor = HslColor(toColor);
     }
   }
 }
